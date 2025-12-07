@@ -29,7 +29,9 @@ import pdb
 import math
 import random
 import numpy as np
-import torchgeometry as tgm
+import kornia as tgm
+from kornia.geometry.transform import warp_perspective
+
 import cv2
 import random
 
@@ -147,9 +149,10 @@ def main():
 
     cudnn.benchmark = True
 
-    if opt.hostname == 'DL178':
-        DATA_DIR = '/media/user/SSD1TB-2/ImageNet' 
-    assert DATA_DIR
+    # if opt.hostname == 'DL178':
+    #     DATA_DIR = '/media/user/SSD1TB-2/ImageNet' 
+    # assert DATA_DIR
+    DATA_DIR = '/root/autodl-fs/UDH/tiny-imagenet-200/tiny-imagenet-200' 
 
 
     ############  create the dirs to save the result #############
@@ -306,7 +309,7 @@ def main():
 
         params = list(Hnet.parameters())+list(Rnet.parameters())
         optimizer = optim.Adam(params, lr=opt.lr, betas=(opt.beta1, 0.999))
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=8, verbose=True)        
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=8)        
 
         train_loader_secret = DataLoader(train_dataset_secret, batch_size=opt.bs_secret*opt.num_secret,
                                   shuffle=True, num_workers=int(opt.workers))
@@ -444,8 +447,8 @@ def forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet,
     homography = torch.from_numpy(homography).float().cuda()
 
     # Apply the homography and then undo it
-    container_img = tgm.warp_perspective(container_img, homography[:, 1], (opt.imageSize, opt.imageSize))
-    container_img = tgm.warp_perspective(container_img, homography[:, 0], (opt.imageSize, opt.imageSize))
+    container_img = warp_perspective(container_img, homography[:, 1], (opt.imageSize, opt.imageSize))
+    container_img = warp_perspective(container_img, homography[:, 0], (opt.imageSize, opt.imageSize))
 
     rev_secret_img = Rnet(container_img) 
     #secret_imgv = Variable(secret_img)  

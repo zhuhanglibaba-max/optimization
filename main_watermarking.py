@@ -154,11 +154,11 @@ def main():
 
     cudnn.benchmark = True
 
-    if opt.hostname == 'DL178':
-        DATA_DIR = '/media/user/SSD1TB-2/ImageNet' 
-    assert DATA_DIR
+    # if opt.hostname == 'DL178':
+    #     DATA_DIR = '/media/user/SSD1TB-2/ImageNet' 
+    # assert DATA_DIR
 
-
+    DATA_DIR = '/root/autodl-fs/UDH/tiny-imagenet-200/tiny-imagenet-200' 
     ############  create the dirs to save the result #############
     if not opt.debug:
         try:
@@ -324,7 +324,9 @@ def main():
 
         params = list(Hnet.parameters())+list(Rnet.parameters())
         optimizer = optim.Adam(params, lr=opt.lr, betas=(opt.beta1, 0.999))
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=8, verbose=True)        
+        scheduler = ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.2, patience=8
+            )
 
         train_loader_secret = DataLoader(train_dataset_secret, batch_size=opt.bs_secret*opt.num_secret,
                                   shuffle=True, num_workers=int(opt.workers))
@@ -536,10 +538,10 @@ def train(train_loader, epoch, Hnet, Rnet, criterion):
         cover_imgv, container_img, secret_imgv_nh, rev_secret_img, errH, errR, diffH, diffR \
         = forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet, criterion)
 
-        Hlosses.update(errH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
-        Rlosses.update(errR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
-        Hdiff.update(diffH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)
-        Rdiff.update(diffR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)
+        Hlosses.update(errH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
+        Rlosses.update(errR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
+        Hdiff.update(diffH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)
+        Rdiff.update(diffR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)
 
         betaerrR_secret = opt.beta * errR
         err_sum = errH + betaerrR_secret
@@ -596,10 +598,10 @@ def validation(val_loader, epoch, Hnet, Rnet, criterion):
         cover_imgv, container_img, secret_imgv_nh, rev_secret_img, errH, errR, diffH, diffR \
         = forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet, criterion, val_cover=1)
 
-        Hlosses.update(errH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
-        Rlosses.update(errR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
-        Hdiff.update(diffH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)
-        Rdiff.update(diffR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)
+        Hlosses.update(errH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
+        Rlosses.update(errR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
+        Hdiff.update(diffH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)
+        Rdiff.update(diffR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)
 
         if i == 0:
             save_result_pic(opt.bs_secret*opt.num_training, cover_imgv, container_img.data, secret_imgv_nh, rev_secret_img.data, epoch, i, opt.validationpics)

@@ -1,6 +1,7 @@
 # encoding: utf-8
 
 import argparse
+import csv
 import os
 import shutil
 import socket
@@ -16,7 +17,7 @@ import torch.utils.data
 import torchvision.utils as vutils
 from tensorboardX import SummaryWriter
 from torch.autograd import Variable
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+# from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 # import utils.transformed as transforms
@@ -29,7 +30,11 @@ import pdb
 import math
 import random
 import numpy as np
-from skimage.measure import compare_ssim as SSIM, compare_psnr as PSNR
+# from skimage.measure import compare_ssim as SSIM, compare_psnr as PSNR
+from skimage.metrics import structural_similarity as SSIM
+from skimage.metrics import peak_signal_noise_ratio as PSNR
+
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 parser = argparse.ArgumentParser()
@@ -94,6 +99,7 @@ parser.add_argument('--no_cover', type=bool, default=False, help='debug mode do 
 parser.add_argument('--plain_cover', type=bool, default=False, help='use plain cover')
 parser.add_argument('--noise_cover', type=bool, default=False, help='use noise cover')
 parser.add_argument('--cover_dependent', type=bool, default=False, help='Whether the secret image is dependent on the cover image')
+parser.add_argument('--data_dir', type=str, default='', help='Path to ImageNet dataset directory (default: auto-detect based on hostname)')
 
 # Custom weights initialization called on netG and netD
 def weights_init(m):
@@ -115,6 +121,7 @@ def print_network(net):
 
 # Code saving
 def save_current_codes(des_path):
+    # 意思是：将当前 main.py 文件复制到目标路径 des_path 下。
     main_file_path = os.path.realpath(__file__)
     cur_work_dir, mainfile = os.path.split(main_file_path)
 
@@ -146,9 +153,34 @@ def main():
 
     cudnn.benchmark = True
 
-    if opt.hostname == 'DL178':
-        DATA_DIR = '/media/user/SSD1TB-2/ImageNet' 
-    assert DATA_DIR
+    # Set DATA_DIR based on command line argument or hostname
+    if opt.data_dir:
+        DATA_DIR = opt.data_dir
+    elif opt.hostname == 'DL178':
+        DATA_DIR = '/root/autodl-fs/UDH/tiny-imagenet-200/tiny-imagenet-200'
+    else:
+        # Default path for autodl environment
+        default_paths = [
+            '/root/autodl-fs/UDH/tiny-imagenet-200/tiny-imagenet-200',
+            '/root/autodl-fs/UDH/tiny-imagenet-200',
+            './datasets/tiny-imagenet-200',
+        ]
+        DATA_DIR = None
+        for path in default_paths:
+            if os.path.exists(path):
+                DATA_DIR = path
+                break
+        
+        if DATA_DIR is None:
+            raise ValueError(
+                f"DATA_DIR not set and could not find dataset in default locations.\n"
+                f"Please specify --data_dir argument or ensure dataset exists in one of:\n"
+                f"  {default_paths}\n"
+                f"Current hostname: {opt.hostname}"
+            )
+    
+    print(f"Using DATA_DIR: {DATA_DIR}")
+    assert DATA_DIR and os.path.exists(DATA_DIR), f"DATA_DIR does not exist: {DATA_DIR}"
 
 
     ############  Create the dirs to save the result ############
@@ -238,9 +270,27 @@ def main():
         assert train_dataset_cover; assert train_dataset_secret
         assert val_dataset_cover; assert val_dataset_secret
     else:
-        opt.checkpoint = "./training/" + opt.test + "/checkPoints/" + "checkpoint.pth.tar"
-        if opt.test_diff != '':
-            opt.checkpoint_diff = "./training/" + opt.test_diff + "/checkPoints/" + "checkpoint.pth.tar"
+        # 如果用户没有通过 --checkpoint 指定路径，则根据 --test 参数自动构建
+        if opt.checkpoint == "":
+            # 处理 opt.test 可能是完整路径或相对路径的情况
+            if os.path.isabs(opt.test):
+                # 如果是绝对路径，直接使用
+                checkpoint_path = os.path.join(opt.test, "checkPoints", "checkpoint.pth.tar")
+            else:
+                # 如果是相对路径，从 training 目录开始
+                checkpoint_path = os.path.join("./training", opt.test, "checkPoints", "checkpoint.pth.tar")
+            opt.checkpoint = checkpoint_path
+            print_log(f"Auto-constructed checkpoint path: {opt.checkpoint}", logPath)
+        
+        # 如果用户没有通过 --checkpoint_diff 指定路径，则根据 --test_diff 参数自动构建
+        if opt.test_diff != '' and opt.checkpoint_diff == "":
+            if os.path.isabs(opt.test_diff):
+                checkpoint_diff_path = os.path.join(opt.test_diff, "checkPoints", "checkpoint.pth.tar")
+            else:
+                checkpoint_diff_path = os.path.join("./training", opt.test_diff, "checkPoints", "checkpoint.pth.tar")
+            opt.checkpoint_diff = checkpoint_diff_path
+            print_log(f"Auto-constructed checkpoint_diff path: {opt.checkpoint_diff}", logPath)
+        
         testdir = valdir
         test_dataset_cover = ImageFolder(
             testdir,  
@@ -285,20 +335,71 @@ def main():
     HnetD = torch.nn.DataParallel(HnetD).cuda()
     RnetD = torch.nn.DataParallel(RnetD).cuda()
 
+    # 需要初始化start_epoch为0，因为在训练时如果没有加载checkpoint，
+    # 训练将从第0轮epoch开始。如果加载了checkpoint，并且其中包含'epoch'字段，
+    # 后续会将start_epoch的值更新为断点保存时的epoch，实现断点续训。
+    start_epoch = 0
+    # 这里之所以这样写，是为了在从断点恢复训练时确保网络模型（Hnet和Rnet）和差分模型（HnetD和RnetD）
+    # 都能正确加载各自训练得到的参数，从而保障继续训练或评测时的结果一致性。
+    # 先判断是否指定了主模型的checkpoint，如果有就加载主模型参数和当前训练轮数；如果指定了checkpoint_diff，
+    # 则同步加载差分网络的参数，便于同时支持主模型和分支（如后处理或对比实验）在同一流程下的灵活加载。
     if opt.checkpoint != "":
-        if opt.checkpoint_diff != "":
-            checkpoint = torch.load(opt.checkpoint)
-            Hnet.load_state_dict(checkpoint['H_state_dict'])
-            Rnet.load_state_dict(checkpoint['R_state_dict'])
+        # 规范化路径，处理相对路径和绝对路径
+        if not os.path.isabs(opt.checkpoint):
+            # 如果是相对路径，确保相对于项目根目录
+            opt.checkpoint = os.path.normpath(opt.checkpoint)
+        
+        # 检查 checkpoint 文件是否存在
+        if not os.path.exists(opt.checkpoint):
+            error_msg = f"Checkpoint file not found: {opt.checkpoint}\n"
+            error_msg += f"Current working directory: {os.getcwd()}\n"
+            error_msg += f"Absolute path: {os.path.abspath(opt.checkpoint)}"
+            raise FileNotFoundError(error_msg)
+        
+        print_log(f"Loading checkpoint from: {opt.checkpoint}", logPath)
+        checkpoint = torch.load(opt.checkpoint)
+        
+        # 尝试加载模型权重，如果严格匹配失败则尝试非严格模式
+        try:
+            Hnet.load_state_dict(checkpoint['H_state_dict'], strict=True)
+            Rnet.load_state_dict(checkpoint['R_state_dict'], strict=True)
+            print_log("Successfully loaded checkpoint with strict=True", logPath)
+        except RuntimeError as e:
+            print_log(f"Warning: Failed to load checkpoint with strict=True: {str(e)[:200]}", logPath)
+            print_log("Attempting to load with strict=False (partial loading)...", logPath)
+            try:
+                Hnet.load_state_dict(checkpoint['H_state_dict'], strict=False)
+                Rnet.load_state_dict(checkpoint['R_state_dict'], strict=False)
+                print_log("Successfully loaded checkpoint with strict=False (some parameters may be missing)", logPath)
+            except Exception as e2:
+                print_log(f"Error: Failed to load checkpoint even with strict=False: {str(e2)[:200]}", logPath)
+                raise
+        
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch']
+        print_log(f"Loaded checkpoint from epoch {start_epoch}", logPath)
 
+        if opt.checkpoint_diff != "":
+            # 规范化 checkpoint_diff 路径
+            if not os.path.isabs(opt.checkpoint_diff):
+                opt.checkpoint_diff = os.path.normpath(opt.checkpoint_diff)
+            
+            # 检查 checkpoint_diff 文件是否存在
+            if not os.path.exists(opt.checkpoint_diff):
+                error_msg = f"Checkpoint_diff file not found: {opt.checkpoint_diff}\n"
+                error_msg += f"Current working directory: {os.getcwd()}\n"
+                error_msg += f"Absolute path: {os.path.abspath(opt.checkpoint_diff)}"
+                raise FileNotFoundError(error_msg)
+            
+            print_log(f"Loading checkpoint_diff from: {opt.checkpoint_diff}", logPath)
             checkpointD = torch.load(opt.checkpoint_diff)
-            HnetD.load_state_dict(checkpointD['H_state_dict'])
-            RnetD.load_state_dict(checkpointD['R_state_dict'])
-        else:
-            checkpoint = torch.load(opt.checkpoint)
-            checkpoint_diff = torch.load(opt.checkpoint_diff)
-            Hnet.load_state_dict(checkpoint_diff['H_state_dict'])
-            Rnet.load_state_dict(checkpoint['R_state_dict'])            
+            try:
+                HnetD.load_state_dict(checkpointD['H_state_dict'], strict=True)
+                RnetD.load_state_dict(checkpointD['R_state_dict'], strict=True)
+            except RuntimeError:
+                HnetD.load_state_dict(checkpointD['H_state_dict'], strict=False)
+                RnetD.load_state_dict(checkpointD['R_state_dict'], strict=False)
+                print_log("Loaded checkpoint_diff with strict=False", logPath)
 
     # Print networks
     print_network(Hnet)
@@ -316,8 +417,21 @@ def main():
             writer = SummaryWriter(log_dir='runs/' + experiment_dir) 
         params = list(Hnet.parameters())+list(Rnet.parameters())
         optimizer = optim.Adam(params, lr=opt.lr, betas=(opt.beta1, 0.999))
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=8, verbose=True)        
-
+        # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=8, verbose=True)        
+        try:
+            scheduler = ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.2, patience=8, verbose=True
+            )
+        except TypeError:
+            scheduler = ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.2, patience=8
+            )
+        
+        # Load optimizer state from checkpoint if available
+        if opt.checkpoint != "" and 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print_log("Loaded optimizer state from checkpoint", logPath)
+        
         train_loader_secret = DataLoader(train_dataset_secret, batch_size=opt.bs_secret*opt.num_secret,
                                   shuffle=True, num_workers=int(opt.workers))
         train_loader_cover = DataLoader(train_dataset_cover, batch_size=opt.bs_secret*opt.num_cover*opt.num_training,
@@ -328,8 +442,15 @@ def main():
                                 shuffle=True, num_workers=int(opt.workers))
 
         smallestLoss = 10000
-        print_log("training is beginning .......................................................", logPath)
-        for epoch in range(opt.epochs):
+        if opt.checkpoint != "" and 'smallestLoss' in checkpoint:
+            smallestLoss = checkpoint.get('smallestLoss', 10000)
+            print_log(f"Resumed smallestLoss: {smallestLoss}", logPath)
+        
+        if start_epoch > 0:
+            print_log(f"Resuming training from epoch {start_epoch} .......................................................", logPath)
+        else:
+            print_log("training is beginning .......................................................", logPath)
+        for epoch in range(start_epoch, opt.epochs):
             adjust_learning_rate(optimizer, epoch)
             train_loader = zip(train_loader_secret, train_loader_cover)
             val_loader = zip(val_loader_secret, val_loader_cover)
@@ -353,7 +474,8 @@ def main():
                 'H_state_dict': Hnet.state_dict(),
                 'R_state_dict': Rnet.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best, epoch, '%s/epoch_%d_Hloss_%.4f_Rloss=%.4f_Hdiff_Hdiff%.4f_Rdiff%.4f' % (opt.outckpts, epoch, val_hloss, val_rloss, val_hdiff, val_rdiff) )
+                'smallestLoss': globals()["smallestLoss"],
+            }, is_best, epoch, '%s/epoch_%d_Hloss_%.4f_Rloss=%.4f_Hdiff_Hdiff%.4f_Rdiff%.4f' % (opt.outckpts, epoch, val_hloss, val_rloss, val_hdiff, val_rdiff), val_hloss, val_rloss, val_hdiff, val_rdiff)
 
         if not opt.debug:
             writer.close()
@@ -368,7 +490,7 @@ def main():
         #validation(test_loader, 0, Hnet=Hnet, Rnet=Rnet, criterion=criterion)
         analysis(test_loader, 0, Hnet=Hnet, Rnet=Rnet, HnetD=HnetD, RnetD=RnetD, criterion=criterion)
 
-def save_checkpoint(state, is_best, epoch, prefix):
+def save_checkpoint(state, is_best, epoch, prefix, val_hloss=None, val_rloss=None, val_hdiff=None, val_rdiff=None):
 
     filename='%s/checkpoint.pth.tar'% opt.outckpts
 
@@ -376,9 +498,21 @@ def save_checkpoint(state, is_best, epoch, prefix):
     if is_best:
         shutil.copyfile(filename, '%s/best_checkpoint.pth.tar'% opt.outckpts)
     if epoch == opt.epochs-1:
-        with open(opt.outckpts + prefix + '.csv', 'a') as csvfile:
+        if os.path.dirname(prefix):  
+            csv_path = prefix + '.csv'
+        else:
+            csv_path = os.path.join(opt.outckpts, prefix + '.csv')
+        
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+        with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile, delimiter='\t')
-            #writer.writerow([epoch, loss, train1, train5, prec1, prec5])
+            # 写入表头
+            writer.writerow(['Epoch', 'H_Loss', 'R_Loss', 'H_Diff', 'R_Diff', 'Sum_Diff'])
+            # 写入数据
+            if val_hloss is not None and val_rloss is not None and val_hdiff is not None and val_rdiff is not None:
+                sum_diff = val_hdiff + val_rdiff
+                writer.writerow([epoch, val_hloss, val_rloss, val_hdiff, val_rdiff, sum_diff])
 
 def forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet, criterion, val_cover=0, i_c=None, position=None, Se_two=None):
 
@@ -477,10 +611,10 @@ def train(train_loader, epoch, Hnet, Rnet, criterion):
         cover_imgv, container_img, secret_imgv_nh, rev_secret_img, errH, errR, diffH, diffR \
         = forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet, criterion)
 
-        Hlosses.update(errH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
-        Rlosses.update(errR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
-        Hdiff.update(diffH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)
-        Rdiff.update(diffR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)
+        Hlosses.update(errH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
+        Rlosses.update(errR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
+        Hdiff.update(diffH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)
+        Rdiff.update(diffR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)
 
         # Loss, backprop, and optimization step
         betaerrR_secret = opt.beta * errR
@@ -539,10 +673,10 @@ def validation(val_loader, epoch, Hnet, Rnet, criterion):
         cover_imgv, container_img, secret_imgv_nh, rev_secret_img, errH, errR, diffH, diffR \
         = forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet, criterion, val_cover=1)
 
-        Hlosses.update(errH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
-        Rlosses.update(errR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
-        Hdiff.update(diffH.data[0], opt.bs_secret*opt.num_cover*opt.num_training)
-        Rdiff.update(diffR.data[0], opt.bs_secret*opt.num_secret*opt.num_training)
+        Hlosses.update(errH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)  # H loss
+        Rlosses.update(errR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)  # R loss
+        Hdiff.update(diffH.detach().item(), opt.bs_secret*opt.num_cover*opt.num_training)
+        Rdiff.update(diffR.detach().item(), opt.bs_secret*opt.num_secret*opt.num_training)
 
         if i == 0:
             save_result_pic(opt.bs_secret*opt.num_training, cover_imgv, container_img.data, secret_imgv_nh, rev_secret_img.data, epoch, i, opt.validationpics)
@@ -593,8 +727,8 @@ def analysis(val_loader, epoch, Hnet, Rnet, HnetD, RnetD, criterion):
         cover_imgv, container_img, secret_imgv_nh, rev_secret_img, errH, errR, diffH, diffR \
         = forward_pass(secret_img, secret_target, cover_img, cover_target, Hnet, Rnet, criterion, val_cover=1)
         secret_encoded = container_img - cover_imgv
-
-        save_result_pic_analysis(opt.bs_secret*opt.num_training, cover_imgv.clone(), container_img.clone(), secret_imgv_nh.clone(), rev_secret_img.clone(), epoch, i, opt.validationpics)
+        n_show = min(opt.bs_secret * opt.num_training, cover_imgv.size(0))
+        save_result_pic_analysis(n_show, cover_imgv.clone(), container_img.clone(), secret_imgv_nh.clone(), rev_secret_img.clone(), epoch, i, opt.validationpics)
 
         N, _, _, _ = rev_secret_img.shape
 
@@ -626,7 +760,14 @@ def analysis(val_loader, epoch, Hnet, Rnet, HnetD, RnetD, criterion):
         # SSIM
         ssim = np.zeros(N)
         for i in range(N):
-            ssim[i] = SSIM(cover_img_numpy[i], container_img_numpy[i], multichannel=True)
+            # 获取图像尺寸并设置合适的 win_size
+            h, w = cover_img_numpy[i].shape[:2]
+            win_size = min(7, min(h, w))
+            if win_size % 2 == 0:
+                win_size -= 1  # win_size 必须是奇数
+            if win_size < 3:
+                win_size = 3
+            ssim[i] = SSIM(cover_img_numpy[i], container_img_numpy[i], channel_axis=-1, win_size=win_size, data_range=1.0)
         print("Avg. SSIM C:", ssim.mean().item())
 
 
@@ -647,7 +788,14 @@ def analysis(val_loader, epoch, Hnet, Rnet, HnetD, RnetD, criterion):
         # SSIM
         ssim = np.zeros(N)
         for i in range(N):
-            ssim[i] = SSIM(secret_img_numpy[i], rev_secret_numpy[i], multichannel=True)
+            # 获取图像尺寸并设置合适的 win_size
+            h, w = secret_img_numpy[i].shape[:2]
+            win_size = min(7, min(h, w))
+            if win_size % 2 == 0:
+                win_size -= 1  # win_size 必须是奇数
+            if win_size < 3:
+                win_size = 3
+            ssim[i] = SSIM(secret_img_numpy[i], rev_secret_numpy[i], channel_axis=-1, win_size=win_size, data_range=1.0)
         print("Avg. SSIM S:", ssim.mean().item())
 
 
@@ -694,7 +842,14 @@ def analysis(val_loader, epoch, Hnet, Rnet, HnetD, RnetD, criterion):
         # SSIM
         ssim = np.zeros(N)
         for i in range(N):
-            ssim[i] = SSIM(secret_img_numpy[i], rev_secret_numpy[i], multichannel=True)
+            # 获取图像尺寸并设置合适的 win_size
+            h, w = secret_img_numpy[i].shape[:2]
+            win_size = min(7, min(h, w))
+            if win_size % 2 == 0:
+                win_size -= 1  # win_size 必须是奇数
+            if win_size < 3:
+                win_size = 3
+            ssim[i] = SSIM(secret_img_numpy[i], rev_secret_numpy[i], channel_axis=-1, win_size=win_size, data_range=1.0)
         print("Avg. SSIM S':", ssim.mean().item())
 
 
@@ -742,7 +897,14 @@ def analysis(val_loader, epoch, Hnet, Rnet, HnetD, RnetD, criterion):
         # SSIM
         ssim = np.zeros(N)
         for i in range(N):
-            ssim[i] = SSIM(cover_img_numpy[i], container_img_numpy[i], multichannel=True)
+            # 获取图像尺寸并设置合适的 win_size
+            h, w = cover_img_numpy[i].shape[:2]
+            win_size = min(7, min(h, w))
+            if win_size % 2 == 0:
+                win_size -= 1  # win_size 必须是奇数
+            if win_size < 3:
+                win_size = 3
+            ssim[i] = SSIM(cover_img_numpy[i], container_img_numpy[i], channel_axis=-1, win_size=win_size, data_range=1.0)
         print("Avg. SSIM C:", ssim.mean().item())
 
 
@@ -763,7 +925,14 @@ def analysis(val_loader, epoch, Hnet, Rnet, HnetD, RnetD, criterion):
         # SSIM
         ssim = np.zeros(N)
         for i in range(N):
-            ssim[i] = SSIM(secret_img_numpy[i], rev_secret_numpy[i], multichannel=True)
+            # 获取图像尺寸并设置合适的 win_size
+            h, w = secret_img_numpy[i].shape[:2]
+            win_size = min(7, min(h, w))
+            if win_size % 2 == 0:
+                win_size -= 1  # win_size 必须是奇数
+            if win_size < 3:
+                win_size = 3
+            ssim[i] = SSIM(secret_img_numpy[i], rev_secret_numpy[i], channel_axis=-1, win_size=win_size, data_range=1.0)
         print("Avg. SSIM S:", ssim.mean().item())
 
 
@@ -797,23 +966,33 @@ def adjust_learning_rate(optimizer, epoch):
 
 # save result pic and the coverImg filePath and the secretImg filePath
 def save_result_pic_analysis(bs_secret_times_num_training, cover, container, secret, rev_secret, epoch, i, save_path=None, postname=''):
-    
+    # num = min(num, cover.size(0), container.size(0), secret.size(0), rev.size(0))
+    # if num <= 0:
+
+    #     return
     path = './qualitative_results/'
     if not os.path.exists(path):
         os.makedirs(path)
     resultImgName = path + 'universal_qualitative_results.png'
 
-    cover = cover[:4]
-    container = container[:4]
-    secret = secret[:4]
-    rev_secret = rev_secret[:4]
+    # cover = cover[:4]
+    # container = container[:4]
+    # secret = secret[:4]
+    # rev_secret = rev_secret[:4]
+    # 限制显示的样本数量，最多4个
+    num_samples = min(4, cover.shape[0])
+    cover = cover[:num_samples]
+    container = container[:num_samples]
+    secret = secret[:num_samples]
+    rev_secret = rev_secret[:num_samples]
 
     cover_gap = container - cover
     secret_gap = rev_secret - secret
     cover_gap = (cover_gap*10 + 0.5).clamp_(0.0, 1.0)
     secret_gap = (secret_gap*10 + 0.5).clamp_(0.0, 1.0)
 
-    for i_cover in range(4):
+    # 使用实际的 num_cover 和 num_secret，而不是硬编码的 4
+    for i_cover in range(opt.num_cover):
         cover_i = cover[:,i_cover*opt.channel_cover:(i_cover+1)*opt.channel_cover,:,:]
         container_i = container[:,i_cover*opt.channel_cover:(i_cover+1)*opt.channel_cover,:,:]
         cover_gap_i = cover_gap[:,i_cover*opt.channel_cover:(i_cover+1)*opt.channel_cover,:,:]
@@ -823,7 +1002,7 @@ def save_result_pic_analysis(bs_secret_times_num_training, cover, container, sec
         else:
             showCover = torch.cat((showCover, cover_i, container_i, cover_gap_i),0)
 
-    for i_secret in range(4):
+    for i_secret in range(opt.num_secret):
         secret_i = secret[:,i_secret*opt.channel_secret:(i_secret+1)*opt.channel_secret,:,:]
         rev_secret_i = rev_secret[:,i_secret*opt.channel_secret:(i_secret+1)*opt.channel_secret,:,:]
         secret_gap_i = secret_gap[:,i_secret*opt.channel_secret:(i_secret+1)*opt.channel_secret,:,:]
@@ -834,10 +1013,36 @@ def save_result_pic_analysis(bs_secret_times_num_training, cover, container, sec
             showSecret = torch.cat((showSecret, secret_i, rev_secret_i, secret_gap_i),0)
 
     showAll = torch.cat((showCover, showSecret),0)
-    showAll = showAll.reshape(6, 4, 3, 128, 128)
-    showAll = showAll.permute(1, 0, 2, 3, 4)
-    showAll = showAll.reshape(4*6, 3, 128, 128)
-    vutils.save_image(showAll, resultImgName, nrow=6, padding=1, normalize=False)
+    
+    # 动态计算 reshape 参数
+    # showCover: [num_samples*3, num_cover*channel_cover, H, W]
+    # showSecret: [num_samples*3, num_secret*channel_secret, H, W]
+    # showAll: [num_samples*6, channel, H, W] (假设 channel_cover == channel_secret)
+    rows_per_sample = 3  # cover, container, gap 或 secret, rev_secret, gap
+    total_rows = rows_per_sample * 2  # 6行：3行cover + 3行secret
+    
+    # 获取图像尺寸（假设所有图像尺寸相同）
+    _, _, H, W = cover_i.shape
+    
+    # 确保通道数匹配（通常 channel_cover == channel_secret == 3）
+    if opt.channel_cover == opt.channel_secret:
+        # reshape: [num_samples*6, channel, H, W] -> [6, num_samples, channel, H, W] -> [num_samples, 6, channel, H, W] -> [num_samples*6, channel, H, W]
+        showAll = showAll.reshape(total_rows, num_samples, opt.channel_cover, H, W)
+        showAll = showAll.permute(1, 0, 2, 3, 4)
+        showAll = showAll.reshape(num_samples * total_rows, opt.channel_cover, H, W)
+        vutils.save_image(showAll, resultImgName, nrow=total_rows, padding=1, normalize=False)
+    else:
+        # 通道数不匹配时，分别保存
+        showCover_reshaped = showCover.reshape(rows_per_sample, num_samples, opt.num_cover * opt.channel_cover, H, W)
+        showCover_reshaped = showCover_reshaped.permute(1, 0, 2, 3, 4)
+        showCover_reshaped = showCover_reshaped.reshape(num_samples * rows_per_sample, opt.num_cover * opt.channel_cover, H, W)
+        
+        showSecret_reshaped = showSecret.reshape(rows_per_sample, num_samples, opt.num_secret * opt.channel_secret, H, W)
+        showSecret_reshaped = showSecret_reshaped.permute(1, 0, 2, 3, 4)
+        showSecret_reshaped = showSecret_reshaped.reshape(num_samples * rows_per_sample, opt.num_secret * opt.channel_secret, H, W)
+        
+        vutils.save_image(showCover_reshaped, path + 'cover_results.png', nrow=rows_per_sample, padding=1, normalize=False)
+        vutils.save_image(showSecret_reshaped, path + 'secret_results.png', nrow=rows_per_sample, padding=1, normalize=False)
 
 # save result pic and the coverImg filePath and the secretImg filePath
 def save_result_pic(bs_secret_times_num_training, cover, container, secret, rev_secret, epoch, i, save_path=None, postname=''):
