@@ -1,5 +1,4 @@
-# Optimization Analysis of Universal and Cover-Dependent Deep Hiding for Visual Data
-Embedding
+# Optimization Analysis of Universal and Cover-Dependent Deep Hiding for Visual Data Embedding
 
 
 ### Datasets 
